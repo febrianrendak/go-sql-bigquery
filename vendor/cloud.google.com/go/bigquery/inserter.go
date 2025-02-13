@@ -24,6 +24,11 @@ import (
 	bq "google.golang.org/api/bigquery/v2"
 )
 
+// NoDedupeID indicates a streaming insert row wants to opt out of best-effort
+// deduplication.
+// It is EXPERIMENTAL and subject to change or removal without notice.
+const NoDedupeID = "NoDedupeID"
+
 // An Inserter does streaming inserts into a BigQuery table.
 // It is safe for concurrent use.
 type Inserter struct {
@@ -172,12 +177,13 @@ func (u *Inserter) putMulti(ctx context.Context, src []ValueSaver) error {
 	if req == nil {
 		return nil
 	}
-	call := u.t.c.bqs.Tabledata.InsertAll(u.t.ProjectID, u.t.DatasetID, u.t.TableID, req)
-	call = call.Context(ctx)
+	call := u.t.c.bqs.Tabledata.InsertAll(u.t.ProjectID, u.t.DatasetID, u.t.TableID, req).Context(ctx)
 	setClientHeader(call.Header())
 	var res *bq.TableDataInsertAllResponse
 	err = runWithRetry(ctx, func() (err error) {
+		sCtx := trace.StartSpan(ctx, "bigquery.tabledata.insertAll")
 		res, err = call.Do()
+		trace.EndSpan(sCtx, err)
 		return err
 	})
 	if err != nil {
@@ -200,7 +206,10 @@ func (u *Inserter) newInsertRequest(savers []ValueSaver) (*bq.TableDataInsertAll
 		if err != nil {
 			return nil, err
 		}
-		if insertID == "" {
+		if insertID == NoDedupeID {
+			// User wants to opt-out of sending deduplication ID.
+			insertID = ""
+		} else if insertID == "" {
 			insertID = randomIDFn()
 		}
 		m := make(map[string]bq.JsonValue)
@@ -221,7 +230,7 @@ func handleInsertErrors(ierrs []*bq.TableDataInsertAllResponseInsertErrors, rows
 	}
 	var errs PutMultiError
 	for _, e := range ierrs {
-		if int(e.Index) > len(rows) {
+		if int(e.Index) >= len(rows) {
 			return fmt.Errorf("internal error: unexpected row index: %v", e.Index)
 		}
 		rie := RowInsertionError{

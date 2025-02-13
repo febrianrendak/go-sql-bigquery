@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/internal/optional"
@@ -44,14 +45,79 @@ type DatasetMetadata struct {
 	Access                  []*AccessEntry    // Access permissions.
 	DefaultEncryptionConfig *EncryptionConfig
 
+	// DefaultPartitionExpiration is the default expiration time for
+	// all newly created partitioned tables in the dataset.
+	DefaultPartitionExpiration time.Duration
+
+	// Defines the default collation specification of future tables
+	// created in the dataset. If a table is created in this dataset without
+	// table-level default collation, then the table inherits the dataset default
+	// collation, which is applied to the string fields that do not have explicit
+	// collation specified. A change to this field affects only tables created
+	// afterwards, and does not alter the existing tables.
+	// More information: https://cloud.google.com/bigquery/docs/reference/standard-sql/collation-concepts
+	DefaultCollation string
+
+	// For externally defined datasets, contains information about the configuration.
+	ExternalDatasetReference *ExternalDatasetReference
+
+	// MaxTimeTravel represents the number of hours for the max time travel for all tables
+	// in the dataset.  Durations are rounded towards zero for the nearest hourly value.
+	MaxTimeTravel time.Duration
+
+	// Storage billing model to be used for all tables in the dataset.
+	// Can be set to PHYSICAL. Default is LOGICAL.
+	// Once you create a dataset with storage billing model set to physical bytes, you can't change it back to using logical bytes again.
+	// More details: https://cloud.google.com/bigquery/docs/datasets-intro#dataset_storage_billing_models
+	StorageBillingModel string
+
 	// These fields are read-only.
 	CreationTime     time.Time
 	LastModifiedTime time.Time // When the dataset or any of its tables were modified.
 	FullID           string    // The full dataset ID in the form projectID:datasetID.
 
+	// The tags associated with this dataset. Tag keys are
+	// globally unique, and managed via the resource manager API.
+	// More information: https://cloud.google.com/resource-manager/docs/tags/tags-overview
+	Tags []*DatasetTag
+
+	// TRUE if the dataset and its table names are case-insensitive, otherwise
+	// FALSE. By default, this is FALSE, which means the dataset and its table
+	// names are case-sensitive. This field does not affect routine references.
+	IsCaseInsensitive bool
+
 	// ETag is the ETag obtained when reading metadata. Pass it to Dataset.Update to
 	// ensure that the metadata hasn't changed since it was read.
 	ETag string
+}
+
+// DatasetTag is a representation of a single tag key/value.
+type DatasetTag struct {
+	// TagKey is the namespaced friendly name of the tag key, e.g.
+	// "12345/environment" where 12345 is org id.
+	TagKey string
+
+	// TagValue is the friendly short name of the tag value, e.g.
+	// "production".
+	TagValue string
+}
+
+const (
+	// LogicalStorageBillingModel indicates billing for logical bytes.
+	LogicalStorageBillingModel = ""
+
+	// PhysicalStorageBillingModel indicates billing for physical bytes.
+	PhysicalStorageBillingModel = "PHYSICAL"
+)
+
+func bqToDatasetTag(in *bq.DatasetTags) *DatasetTag {
+	if in == nil {
+		return nil
+	}
+	return &DatasetTag{
+		TagKey:   in.TagKey,
+		TagValue: in.TagValue,
+	}
 }
 
 // DatasetMetadataToUpdate is used when updating a dataset's metadata.
@@ -64,12 +130,39 @@ type DatasetMetadataToUpdate struct {
 	// If set to time.Duration(0), new tables never expire.
 	DefaultTableExpiration optional.Duration
 
+	// DefaultTableExpiration is the default expiration time for
+	// all newly created partitioned tables.
+	// If set to time.Duration(0), new table partitions never expire.
+	DefaultPartitionExpiration optional.Duration
+
 	// DefaultEncryptionConfig defines CMEK settings for new resources created
 	// in the dataset.
 	DefaultEncryptionConfig *EncryptionConfig
 
+	// Defines the default collation specification of future tables
+	// created in the dataset.
+	DefaultCollation optional.String
+
+	// For externally defined datasets, contains information about the configuration.
+	ExternalDatasetReference *ExternalDatasetReference
+
+	// MaxTimeTravel represents the number of hours for the max time travel for all tables
+	// in the dataset.  Durations are rounded towards zero for the nearest hourly value.
+	MaxTimeTravel optional.Duration
+
+	// Storage billing model to be used for all tables in the dataset.
+	// Can be set to PHYSICAL. Default is LOGICAL.
+	// Once you change a dataset's storage billing model to use physical bytes, you can't change it back to using logical bytes again.
+	// More details: https://cloud.google.com/bigquery/docs/datasets-intro#dataset_storage_billing_models
+	StorageBillingModel optional.String
+
 	// The entire access list. It is not possible to replace individual entries.
 	Access []*AccessEntry
+
+	// TRUE if the dataset and its table names are case-insensitive, otherwise
+	// FALSE. By default, this is FALSE, which means the dataset and its table
+	// names are case-sensitive. This field does not affect routine references.
+	IsCaseInsensitive optional.Bool
 
 	labelUpdater
 }
@@ -88,11 +181,46 @@ func (c *Client) DatasetInProject(projectID, datasetID string) *Dataset {
 	}
 }
 
-// Create creates a dataset in the BigQuery service. An error will be returned if the
-// dataset already exists. Pass in a DatasetMetadata value to configure the dataset.
+// Identifier returns the ID of the dataset in the requested format.
+//
+// For Standard SQL format, the identifier will be quoted if the
+// ProjectID contains dash (-) characters.
+func (d *Dataset) Identifier(f IdentifierFormat) (string, error) {
+	switch f {
+	case LegacySQLID:
+		return fmt.Sprintf("%s:%s", d.ProjectID, d.DatasetID), nil
+	case StandardSQLID:
+		// Quote project identifiers if they have a dash character.
+		if strings.Contains(d.ProjectID, "-") {
+			return fmt.Sprintf("`%s`.%s", d.ProjectID, d.DatasetID), nil
+		}
+		return fmt.Sprintf("%s.%s", d.ProjectID, d.DatasetID), nil
+	default:
+		return "", ErrUnknownIdentifierFormat
+	}
+}
+
+// Create creates a dataset in the BigQuery service.
+//
+// An error will be returned if the dataset already exists.
+// Pass in a DatasetMetadata value to configure the dataset.
 func (d *Dataset) Create(ctx context.Context, md *DatasetMetadata) (err error) {
+	return d.CreateWithOptions(ctx, md)
+}
+
+// CreateWithOptions creates a dataset in the BigQuery service, and
+// provides additional options to control the behavior of the call.
+//
+// An error will be returned if the dataset already exists.
+// Pass in a DatasetMetadata value to configure the dataset.
+func (d *Dataset) CreateWithOptions(ctx context.Context, md *DatasetMetadata, opts ...DatasetOption) (err error) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigquery.Dataset.Create")
 	defer func() { trace.EndSpan(ctx, err) }()
+
+	cOpt := &dsCallOption{}
+	for _, o := range opts {
+		o(cOpt)
+	}
 
 	ds, err := md.toBQ()
 	if err != nil {
@@ -105,6 +233,9 @@ func (d *Dataset) Create(ctx context.Context, md *DatasetMetadata) (err error) {
 	}
 	call := d.c.bqs.Datasets.Insert(d.ProjectID, ds).Context(ctx)
 	setClientHeader(call.Header())
+	if cOpt.accessPolicyVersion != nil {
+		call.AccessPolicyVersion(int64(optional.ToInt(cOpt.accessPolicyVersion)))
+	}
 	_, err = call.Do()
 	return err
 }
@@ -118,6 +249,11 @@ func (dm *DatasetMetadata) toBQ() (*bq.Dataset, error) {
 	ds.Description = dm.Description
 	ds.Location = dm.Location
 	ds.DefaultTableExpirationMs = int64(dm.DefaultTableExpiration / time.Millisecond)
+	ds.DefaultPartitionExpirationMs = int64(dm.DefaultPartitionExpiration / time.Millisecond)
+	ds.DefaultCollation = dm.DefaultCollation
+	ds.MaxTimeTravelHours = int64(dm.MaxTimeTravel / time.Hour)
+	ds.StorageBillingModel = string(dm.StorageBillingModel)
+	ds.IsCaseInsensitive = dm.IsCaseInsensitive
 	ds.Labels = dm.Labels
 	var err error
 	ds.Access, err = accessListToBQ(dm.Access)
@@ -138,6 +274,9 @@ func (dm *DatasetMetadata) toBQ() (*bq.Dataset, error) {
 	}
 	if dm.DefaultEncryptionConfig != nil {
 		ds.DefaultEncryptionConfiguration = dm.DefaultEncryptionConfig.toBQ()
+	}
+	if dm.ExternalDatasetReference != nil {
+		ds.ExternalDatasetReference = dm.ExternalDatasetReference.toBQ()
 	}
 	return ds, nil
 }
@@ -170,45 +309,108 @@ func (d *Dataset) deleteInternal(ctx context.Context, deleteContents bool) (err 
 
 	call := d.c.bqs.Datasets.Delete(d.ProjectID, d.DatasetID).Context(ctx).DeleteContents(deleteContents)
 	setClientHeader(call.Header())
-	return call.Do()
+	return runWithRetry(ctx, func() (err error) {
+		sCtx := trace.StartSpan(ctx, "bigquery.datasets.delete")
+		err = call.Do()
+		trace.EndSpan(sCtx, err)
+		return err
+	})
 }
 
 // Metadata fetches the metadata for the dataset.
 func (d *Dataset) Metadata(ctx context.Context) (md *DatasetMetadata, err error) {
+	return d.MetadataWithOptions(ctx)
+}
+
+// MetadataWithOptions fetches metadata for the dataset, and provides additional options for
+// controlling the request.
+func (d *Dataset) MetadataWithOptions(ctx context.Context, opts ...DatasetOption) (md *DatasetMetadata, err error) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigquery.Dataset.Metadata")
 	defer func() { trace.EndSpan(ctx, err) }()
 
+	cOpt := &dsCallOption{}
+	for _, o := range opts {
+		o(cOpt)
+	}
+
 	call := d.c.bqs.Datasets.Get(d.ProjectID, d.DatasetID).Context(ctx)
 	setClientHeader(call.Header())
+	if cOpt.accessPolicyVersion != nil {
+		call.AccessPolicyVersion(int64(optional.ToInt(cOpt.accessPolicyVersion)))
+	}
 	var ds *bq.Dataset
 	if err := runWithRetry(ctx, func() (err error) {
+		sCtx := trace.StartSpan(ctx, "bigquery.datasets.get")
 		ds, err = call.Do()
+		trace.EndSpan(sCtx, err)
 		return err
 	}); err != nil {
 		return nil, err
 	}
-	return bqToDatasetMetadata(ds)
+	return bqToDatasetMetadata(ds, d.c)
 }
 
-func bqToDatasetMetadata(d *bq.Dataset) (*DatasetMetadata, error) {
+// dsCallOption provides a general option holder for dataset RPCs
+type dsCallOption struct {
+	accessPolicyVersion optional.Int
+}
+
+// DatasetOption provides an option type for customizing requests against the Dataset
+// service.
+type DatasetOption func(*dsCallOption)
+
+// WithAccessPolicyVersion is an option that enabled setting of the Access Policy Version for a request
+// where appropriate.  Valid values are 0, 1, and 3.
+//
+// Requests specifying an invalid value will be rejected.
+// Requests for conditional access policy binding in datasets must specify version 3.
+//
+// Dataset with no conditional role bindings in access policy may specify any valid value
+// or leave the field unset.
+//
+// This field will be mapped to [IAM Policy version] (https://cloud.google.com/iam/docs/policies#versions)
+// and will be used to fetch policy from IAM. If unset or if 0 or 1 value is used for
+// dataset with conditional bindings, access entry with condition will have role string
+// appended by 'withcond' string followed by a hash value.
+//
+// Please refer https://cloud.google.com/iam/docs/troubleshooting-withcond for more details.
+func WithAccessPolicyVersion(apv int) DatasetOption {
+	return func(o *dsCallOption) {
+		o.accessPolicyVersion = apv
+	}
+}
+
+func bqToDatasetMetadata(d *bq.Dataset, c *Client) (*DatasetMetadata, error) {
 	dm := &DatasetMetadata{
-		CreationTime:            unixMillisToTime(d.CreationTime),
-		LastModifiedTime:        unixMillisToTime(d.LastModifiedTime),
-		DefaultTableExpiration:  time.Duration(d.DefaultTableExpirationMs) * time.Millisecond,
-		DefaultEncryptionConfig: bqToEncryptionConfig(d.DefaultEncryptionConfiguration),
-		Description:             d.Description,
-		Name:                    d.FriendlyName,
-		FullID:                  d.Id,
-		Location:                d.Location,
-		Labels:                  d.Labels,
-		ETag:                    d.Etag,
+		CreationTime:               unixMillisToTime(d.CreationTime),
+		LastModifiedTime:           unixMillisToTime(d.LastModifiedTime),
+		DefaultTableExpiration:     time.Duration(d.DefaultTableExpirationMs) * time.Millisecond,
+		DefaultPartitionExpiration: time.Duration(d.DefaultPartitionExpirationMs) * time.Millisecond,
+		DefaultCollation:           d.DefaultCollation,
+		ExternalDatasetReference:   bqToExternalDatasetReference(d.ExternalDatasetReference),
+		MaxTimeTravel:              time.Duration(d.MaxTimeTravelHours) * time.Hour,
+		StorageBillingModel:        d.StorageBillingModel,
+		DefaultEncryptionConfig:    bqToEncryptionConfig(d.DefaultEncryptionConfiguration),
+		Description:                d.Description,
+		Name:                       d.FriendlyName,
+		FullID:                     d.Id,
+		Location:                   d.Location,
+		Labels:                     d.Labels,
+		IsCaseInsensitive:          d.IsCaseInsensitive,
+		ETag:                       d.Etag,
 	}
 	for _, a := range d.Access {
-		e, err := bqToAccessEntry(a, nil)
+		e, err := bqToAccessEntry(a, c)
 		if err != nil {
 			return nil, err
 		}
 		dm.Access = append(dm.Access, e)
+	}
+	for _, bqTag := range d.Tags {
+		tag := bqToDatasetTag(bqTag)
+		if tag != nil {
+			dm.Tags = append(dm.Tags, tag)
+		}
 	}
 	return dm, nil
 }
@@ -218,26 +420,46 @@ func bqToDatasetMetadata(d *bq.Dataset) (*DatasetMetadata, error) {
 // set the etag argument to the DatasetMetadata.ETag field from the read.
 // Pass the empty string for etag for a "blind write" that will always succeed.
 func (d *Dataset) Update(ctx context.Context, dm DatasetMetadataToUpdate, etag string) (md *DatasetMetadata, err error) {
+	return d.UpdateWithOptions(ctx, dm, etag)
+}
+
+// UpdateWithOptions modifies specific Dataset metadata fields and
+// provides an interface for specifying additional options to the request.
+//
+// To perform a read-modify-write that protects against intervening reads,
+// set the etag argument to the DatasetMetadata.ETag field from the read.
+// Pass the empty string for etag for a "blind write" that will always succeed.
+func (d *Dataset) UpdateWithOptions(ctx context.Context, dm DatasetMetadataToUpdate, etag string, opts ...DatasetOption) (md *DatasetMetadata, err error) {
 	ctx = trace.StartSpan(ctx, "cloud.google.com/go/bigquery.Dataset.Update")
 	defer func() { trace.EndSpan(ctx, err) }()
 
+	cOpt := &dsCallOption{}
+	for _, o := range opts {
+		o(cOpt)
+	}
 	ds, err := dm.toBQ()
 	if err != nil {
 		return nil, err
 	}
+
 	call := d.c.bqs.Datasets.Patch(d.ProjectID, d.DatasetID, ds).Context(ctx)
 	setClientHeader(call.Header())
 	if etag != "" {
 		call.Header().Set("If-Match", etag)
 	}
+	if cOpt.accessPolicyVersion != nil {
+		call.AccessPolicyVersion(int64(optional.ToInt(cOpt.accessPolicyVersion)))
+	}
 	var ds2 *bq.Dataset
 	if err := runWithRetry(ctx, func() (err error) {
+		sCtx := trace.StartSpan(ctx, "bigquery.datasets.patch")
 		ds2, err = call.Do()
+		trace.EndSpan(sCtx, err)
 		return err
 	}); err != nil {
 		return nil, err
 	}
-	return bqToDatasetMetadata(ds2)
+	return bqToDatasetMetadata(ds2, d.c)
 }
 
 func (dm *DatasetMetadataToUpdate) toBQ() (*bq.Dataset, error) {
@@ -263,6 +485,36 @@ func (dm *DatasetMetadataToUpdate) toBQ() (*bq.Dataset, error) {
 			ds.DefaultTableExpirationMs = int64(dur / time.Millisecond)
 		}
 	}
+	if dm.DefaultPartitionExpiration != nil {
+		dur := optional.ToDuration(dm.DefaultPartitionExpiration)
+		if dur == 0 {
+			// Send a null to delete the field.
+			ds.NullFields = append(ds.NullFields, "DefaultPartitionExpirationMs")
+		} else {
+			ds.DefaultPartitionExpirationMs = int64(dur / time.Millisecond)
+		}
+	}
+	if dm.DefaultCollation != nil {
+		ds.DefaultCollation = optional.ToString(dm.DefaultCollation)
+		forceSend("DefaultCollation")
+	}
+	if dm.ExternalDatasetReference != nil {
+		ds.ExternalDatasetReference = dm.ExternalDatasetReference.toBQ()
+		forceSend("ExternalDatasetReference")
+	}
+	if dm.MaxTimeTravel != nil {
+		dur := optional.ToDuration(dm.MaxTimeTravel)
+		if dur == 0 {
+			// Send a null to delete the field.
+			ds.NullFields = append(ds.NullFields, "MaxTimeTravelHours")
+		} else {
+			ds.MaxTimeTravelHours = int64(dur / time.Hour)
+		}
+	}
+	if dm.StorageBillingModel != nil {
+		ds.StorageBillingModel = optional.ToString(dm.StorageBillingModel)
+		forceSend("StorageBillingModel")
+	}
 	if dm.DefaultEncryptionConfig != nil {
 		ds.DefaultEncryptionConfiguration = dm.DefaultEncryptionConfig.toBQ()
 		ds.DefaultEncryptionConfiguration.ForceSendFields = []string{"KmsKeyName"}
@@ -276,6 +528,10 @@ func (dm *DatasetMetadataToUpdate) toBQ() (*bq.Dataset, error) {
 		if len(ds.Access) == 0 {
 			ds.NullFields = append(ds.NullFields, "Access")
 		}
+	}
+	if dm.IsCaseInsensitive != nil {
+		ds.IsCaseInsensitive = optional.ToBool(dm.IsCaseInsensitive)
+		forceSend("IsCaseInsensitive")
 	}
 	labels, forces, nulls := dm.update()
 	ds.Labels = labels
@@ -339,7 +595,9 @@ var listTables = func(it *TableIterator, pageSize int, pageToken string) (*bq.Ta
 	}
 	var res *bq.TableList
 	err := runWithRetry(it.ctx, func() (err error) {
+		sCtx := trace.StartSpan(it.ctx, "bigquery.tables.list")
 		res, err = call.Do()
+		trace.EndSpan(sCtx, err)
 		return err
 	})
 	return res, err
@@ -424,7 +682,9 @@ var listModels = func(it *ModelIterator, pageSize int, pageToken string) (*bq.Li
 	}
 	var res *bq.ListModelsResponse
 	err := runWithRetry(it.ctx, func() (err error) {
+		sCtx := trace.StartSpan(it.ctx, "bigquery.models.list")
 		res, err = call.Do()
+		trace.EndSpan(sCtx, err)
 		return err
 	})
 	return res, err
@@ -511,7 +771,9 @@ var listRoutines = func(it *RoutineIterator, pageSize int, pageToken string) (*b
 	}
 	var res *bq.ListRoutinesResponse
 	err := runWithRetry(it.ctx, func() (err error) {
+		sCtx := trace.StartSpan(it.ctx, "bigquery.routines.list")
 		res, err = call.Do()
+		trace.EndSpan(sCtx, err)
 		return err
 	})
 	return res, err
@@ -615,7 +877,9 @@ var listDatasets = func(it *DatasetIterator, pageSize int, pageToken string) (*b
 	}
 	var res *bq.DatasetList
 	err := runWithRetry(it.ctx, func() (err error) {
+		sCtx := trace.StartSpan(it.ctx, "bigquery.datasets.list")
 		res, err = call.Do()
+		trace.EndSpan(sCtx, err)
 		return err
 	})
 	return res, err
@@ -638,10 +902,56 @@ func (it *DatasetIterator) fetch(pageSize int, pageToken string) (string, error)
 
 // An AccessEntry describes the permissions that an entity has on a dataset.
 type AccessEntry struct {
-	Role       AccessRole // The role of the entity
-	EntityType EntityType // The type of entity
-	Entity     string     // The entity (individual or group) granted access
-	View       *Table     // The view granted access (EntityType must be ViewEntity)
+	Role       AccessRole          // The role of the entity
+	EntityType EntityType          // The type of entity
+	Entity     string              // The entity (individual or group) granted access
+	View       *Table              // The view granted access (EntityType must be ViewEntity)
+	Routine    *Routine            // The routine granted access (only UDF currently supported)
+	Dataset    *DatasetAccessEntry // The resources within a dataset granted access.
+	Condition  *Expr               // Condition for the access binding.
+}
+
+// Expr represents the conditional information related to dataset access policies.
+type Expr struct {
+	// Textual representation of an expression in Common Expression Language syntax.
+	Expression string
+
+	// Optional. Title for the expression, i.e. a short string describing
+	// its purpose. This can be used e.g. in UIs which allow to enter the
+	// expression.
+	Title string
+
+	// Optional. Description of the expression. This is a longer text which
+	// describes the expression, e.g. when hovered over it in a UI.
+	Description string
+
+	// Optional. String indicating the location of the expression for error
+	// reporting, e.g. a file name and a position in the file.
+	Location string
+}
+
+func (ex *Expr) toBQ() *bq.Expr {
+	if ex == nil {
+		return nil
+	}
+	return &bq.Expr{
+		Expression:  ex.Expression,
+		Title:       ex.Title,
+		Description: ex.Description,
+		Location:    ex.Location,
+	}
+}
+
+func bqToExpr(bq *bq.Expr) *Expr {
+	if bq == nil {
+		return nil
+	}
+	return &Expr{
+		Expression:  bq.Expression,
+		Title:       bq.Title,
+		Description: bq.Description,
+		Location:    bq.Location,
+	}
 }
 
 // AccessRole is the level of access to grant to a dataset.
@@ -673,12 +983,25 @@ const (
 	// allAuthenticatedUsers.
 	SpecialGroupEntity
 
-	// ViewEntity is a BigQuery view.
+	// ViewEntity is a BigQuery logical view.
 	ViewEntity
+
+	// IAMMemberEntity represents entities present in IAM but not represented using
+	// the other entity types.
+	IAMMemberEntity
+
+	// RoutineEntity is a BigQuery routine, referencing a User Defined Function (UDF).
+	RoutineEntity
+
+	// DatasetEntity is BigQuery dataset, present in the access list.
+	DatasetEntity
 )
 
 func (e *AccessEntry) toBQ() (*bq.DatasetAccess, error) {
-	q := &bq.DatasetAccess{Role: string(e.Role)}
+	q := &bq.DatasetAccess{
+		Role:      string(e.Role),
+		Condition: e.Condition.toBQ(),
+	}
 	switch e.EntityType {
 	case DomainEntity:
 		q.Domain = e.Entity
@@ -690,6 +1013,12 @@ func (e *AccessEntry) toBQ() (*bq.DatasetAccess, error) {
 		q.SpecialGroup = e.Entity
 	case ViewEntity:
 		q.View = e.View.toBQ()
+	case IAMMemberEntity:
+		q.IamMember = e.Entity
+	case RoutineEntity:
+		q.Routine = e.Routine.toBQ()
+	case DatasetEntity:
+		q.Dataset = e.Dataset.toBQ()
 	default:
 		return nil, fmt.Errorf("bigquery: unknown entity type %d", e.EntityType)
 	}
@@ -714,8 +1043,87 @@ func bqToAccessEntry(q *bq.DatasetAccess, c *Client) (*AccessEntry, error) {
 	case q.View != nil:
 		e.View = c.DatasetInProject(q.View.ProjectId, q.View.DatasetId).Table(q.View.TableId)
 		e.EntityType = ViewEntity
+	case q.IamMember != "":
+		e.Entity = q.IamMember
+		e.EntityType = IAMMemberEntity
+	case q.Routine != nil:
+		e.Routine = c.DatasetInProject(q.Routine.ProjectId, q.Routine.DatasetId).Routine(q.Routine.RoutineId)
+		e.EntityType = RoutineEntity
+	case q.Dataset != nil:
+		e.Dataset = bqToDatasetAccessEntry(q.Dataset, c)
+		e.EntityType = DatasetEntity
 	default:
 		return nil, errors.New("bigquery: invalid access value")
 	}
+	if q.Condition != nil {
+		e.Condition = bqToExpr(q.Condition)
+	}
 	return e, nil
+}
+
+// DatasetAccessEntry is an access entry that refers to resources within
+// another dataset.
+type DatasetAccessEntry struct {
+	// The dataset to which this entry applies.
+	Dataset *Dataset
+	// The list of target types within the dataset
+	// to which this entry applies.
+	//
+	// Current supported values:
+	//
+	// VIEWS - This entry applies to views in the dataset.
+	TargetTypes []string
+}
+
+func (dae *DatasetAccessEntry) toBQ() *bq.DatasetAccessEntry {
+	if dae == nil {
+		return nil
+	}
+	return &bq.DatasetAccessEntry{
+		Dataset: &bq.DatasetReference{
+			ProjectId: dae.Dataset.ProjectID,
+			DatasetId: dae.Dataset.DatasetID,
+		},
+		TargetTypes: dae.TargetTypes,
+	}
+}
+
+func bqToDatasetAccessEntry(entry *bq.DatasetAccessEntry, c *Client) *DatasetAccessEntry {
+	if entry == nil {
+		return nil
+	}
+	return &DatasetAccessEntry{
+		Dataset:     c.DatasetInProject(entry.Dataset.ProjectId, entry.Dataset.DatasetId),
+		TargetTypes: entry.TargetTypes,
+	}
+}
+
+// ExternalDatasetReference provides information about external dataset metadata.
+type ExternalDatasetReference struct {
+	//The connection id that is used to access the external_source.
+	// Format: projects/{project_id}/locations/{location_id}/connections/{connection_id}
+	Connection string
+
+	// External source that backs this dataset.
+	ExternalSource string
+}
+
+func bqToExternalDatasetReference(bq *bq.ExternalDatasetReference) *ExternalDatasetReference {
+	if bq == nil {
+		return nil
+	}
+	return &ExternalDatasetReference{
+		Connection:     bq.Connection,
+		ExternalSource: bq.ExternalSource,
+	}
+}
+
+func (edr *ExternalDatasetReference) toBQ() *bq.ExternalDatasetReference {
+	if edr == nil {
+		return nil
+	}
+	return &bq.ExternalDatasetReference{
+		Connection:     edr.Connection,
+		ExternalSource: edr.ExternalSource,
+	}
 }
