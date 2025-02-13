@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/api/iterator"
@@ -134,9 +135,24 @@ func (c *Conn) execContext(ctx context.Context, query string, args []driver.Valu
 	}
 
 	q := c.client.Query(query)
+
+	job, err := q.Run(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := job.Wait(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if status.Err() != nil {
+		return nil, status.Err()
+	}
+
 	q.DefaultProjectID = c.cfg.ProjectID // allows omitting project in table reference
 	q.DefaultDatasetID = c.cfg.DatasetID // allows omitting dataset in table reference
-	it, err := q.Read(ctx)
+	it, err := job.Read(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -146,14 +162,16 @@ func (c *Conn) execContext(ctx context.Context, query string, args []driver.Valu
 	for {
 		var row []bigquery.Value
 		err := it.Next(&row)
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		}
-		if err != nil {
+
+		if err != nil && !errors.Is(err, iterator.Done) {
 			return nil, err
 		}
 		//data = append(data, row)
 	}
+
 	res = &result{
 		rowsAffected: int64(it.TotalRows),
 	}
@@ -216,10 +234,10 @@ func (c *Conn) Ping(ctx context.Context) (err error) {
 	md, err = c.ds.Metadata(ctx)
 	if err != nil {
 		logrus.Debugf("Failed Ping Dataset: %s", c.cfg.DatasetID)
-		return
+		return err
 	}
 	logrus.Debugf("Successful Ping: %s", md.FullID)
-	return
+	return err
 }
 
 // Deprecated: Drivers should implement QueryerContext instead.
@@ -237,9 +255,24 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 
 func (c *Conn) queryContext(ctx context.Context, query string, args []driver.Value) (driver.Rows, error) {
 	q := c.client.Query(query)
+
+	job, err := q.Run(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	status, err := job.Wait(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	if status.Err() != nil {
+		return nil, status.Err()
+	}
+
 	q.DefaultProjectID = c.cfg.ProjectID // allows omitting project in table reference
 	q.DefaultDatasetID = c.cfg.DatasetID // allows omitting dataset in table reference
-	rowsIterator, err := q.Read(ctx)
+	rowsIterator, err := job.Read(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +281,7 @@ func (c *Conn) queryContext(ctx context.Context, query string, args []driver.Val
 		rs: resultSet{},
 		c:  c,
 	}
+
 	for _, column := range rowsIterator.Schema {
 		res.columns = append(res.columns, column.Name)
 		res.types = append(res.types, fmt.Sprintf("%v", column.Type))
@@ -255,10 +289,10 @@ func (c *Conn) queryContext(ctx context.Context, query string, args []driver.Val
 	for {
 		var row []bigquery.Value
 		err := rowsIterator.Next(&row)
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, iterator.Done) {
 			return nil, err
 		}
 		res.rs.data = append(res.rs.data, row)

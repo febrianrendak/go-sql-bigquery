@@ -1,3 +1,5 @@
 # Created by .ignore support plugin (hsz.mobi)
 go.sum
 .idea
+vendor
+samplev2
