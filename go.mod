@@ -1,11 +1,13 @@
 module github.com/febrianrendak/go-sql-bigquery
 
-go 1.23.6
+go 1.23.2
+
+replace github.com/envoyproxy/go-control-plane => github.com/envoyproxy/go-control-plane v0.13.4
 
 require (
 	cloud.google.com/go/bigquery v1.66.2
 	github.com/DATA-DOG/go-sqlmock v1.5.2
-	github.com/infobloxopen/protoc-gen-gorm/types v0.0.0-20250131061736-a23e54816809
+	github.com/infobloxopen/protoc-gen-gorm v0.20.0
 	github.com/jinzhu/gorm v1.9.16
 	github.com/satori/go.uuid v1.2.0
 	github.com/sirupsen/logrus v1.9.3
@@ -21,7 +23,6 @@ require (
 	cloud.google.com/go/iam v1.3.1 // indirect
 	github.com/apache/arrow/go/v15 v15.0.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/envoyproxy/go-control-plane/envoy v1.32.4 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.2 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
